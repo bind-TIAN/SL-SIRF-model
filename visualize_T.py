@@ -31,9 +31,9 @@ def save_video(sequence_path, video_path, video_name, frame):
     # save plots as video
     image_input_path = os.path.join(sequence_path, "sequence%05d.png")
     video_output_path = os.path.join(video_path, video_name + '.mp4')
-    command = "ffmpeg -r " + str(frame) + " -i " + image_input_path + " -vcodec mpeg4 -y " + video_output_path
+    # command = "ffmpeg -r " + str(frame) + " -i " + image_input_path + " -vcodec mpeg4 -y " + video_output_path
     # print("Creating video: input sequence --> ", image_input_path, " | output video --> ", video_output_path)
-    os.system(str(command))
+    # os.system(str(command))
 
 
 def min_max_scaler(arr, min, max, min_range, max_range):
@@ -319,8 +319,8 @@ def create_plot_animation(plt, trajs, shuffled_ped_ids, target_id, inv_lookup, s
         frames.append(frame_obj)
     plt.gca().legend(loc='best')
     ani = animation.ArtistAnimation(plt.gcf(), frames, interval=1200, blit=False, repeat_delay=1000)  # add code
-    plt.rcParams['animation.ffmpeg_path'] = os.path.abspath("ffmpeg")  # add code
-    FFwriter = animation.FFMpegWriter(fps=10, extra_args=['-vcodec', 'libx264'])  # add code
+    # plt.rcParams['animation.ffmpeg_path'] = os.path.abspath("ffmpeg")  # add code
+    # FFwriter = animation.FFMpegWriter(fps=10, extra_args=['-vcodec', 'libx264'])  # add code
     # ani.save(plot_directory + '/' + name + '.mp4', writer=FFwriter)  # add code
     # ani.save(plot_directory + '/' + name + '.mp4')
     print("Video creation ended.")
