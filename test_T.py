@@ -1,0 +1,542 @@
+import functools
+import os
+import pickle
+import argparse
+import time
+import subprocess
+import torch
+from torch.autograd import Variable
+import numpy as np
+from utils import DataLoader
+from helper import *
+from grid import getSequenceGridMask, getGridMask
+import matplotlib.pyplot as plt
+from scipy.stats import multivariate_normal
+from mpl_toolkits.mplot3d import Axes3D
+from icecream import ic
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    # Observed length of the trajectory parameter
+    parser.add_argument('--obs_length', type=int, default=8, help='Observed length of the trajectory')
+    # Predicted length of the trajectory parameter
+    parser.add_argument('--pred_length', type=int, default=12, help='Predicted length of the trajectory')
+    # Model to be loaded
+    parser.add_argument('--epoch', type=int, default=14, help='Epoch of model to be loaded')
+    # cuda support
+    parser.add_argument('--use_cuda', action="store_true", default=False, help='Use GPU or not')
+    # drive support
+    parser.add_argument('--drive', action="store_true", default=False, help='Use Google drive or not')
+    # number of iteration -> we are trying many times to get lowest test error derived from observed part and prediction of observed
+    # part.Currently it is useless because we are using direct copy of observed part and no use of prediction.Test error will be 0.
+    parser.add_argument('--iteration', type=int, default=1,
+                        help='Number of iteration to create test file (smallest test errror will be selected)')
+    # gru model
+    parser.add_argument('--gru', action="store_true", default=False, help='True : GRU cell, False: LSTM cell')
+    # method selection
+    parser.add_argument('--method', type=int, default=1,
+                        help='Method of lstm will be used (1 = social lstm, 2 = obstacle lstm, 3 = vanilla lstm)')
+    parser.add_argument('--particle_number', type=int, default=10, help='Number of sampling particles')
+    # Parse the parameters
+    sample_args = parser.parse_args()
+    # for drive run
+    prefix = ''
+    f_prefix = '.'
+    if sample_args.drive is True:
+        prefix = 'drive/semester_project/social_lstm_final/'
+        f_prefix = 'drive/semester_project/social_lstm_final'
+    # run sh file for folder creation
+    if not os.path.isdir("log/"):
+        print("Directory creation script is running...")
+        subprocess.call([f_prefix + '/make_directories.sh'])
+    method_name = get_method_name(sample_args.method)
+    model_name = "LSTM"
+    save_tar_name = method_name + "_lstm_model_"
+    if sample_args.gru:
+        model_name = "GRU"
+        save_tar_name = method_name + "_gru_model_"
+    print("Selected method name: ", method_name, " model name: ", model_name)
+    # Save directory
+    save_directory = os.path.join(f_prefix, 'model/', method_name, model_name)
+    # plot directory for plotting in the future
+    plot_directory = os.path.join(f_prefix, 'plot/', method_name, model_name)
+    result_directory = os.path.join(f_prefix, 'result/', method_name)
+    plot_test_file_directory = 'test'
+    # Define the path for the config file for saved args
+    with open(os.path.join(save_directory, 'config.pkl'), 'rb') as f:
+        saved_args = pickle.load(f)
+    saved_args.use_cuda = False
+    seq_lenght = sample_args.pred_length + sample_args.obs_length
+    # Create the DataLoader object
+    dataloader = DataLoader(f_prefix, 1, seq_lenght, forcePreProcess=True, infer=True)
+    create_directories(os.path.join(result_directory, model_name), dataloader.get_all_directory_namelist())
+    create_directories(plot_directory, [plot_test_file_directory])
+    dataloader.reset_batch_pointer()
+    dataset_pointer_ins = dataloader.dataset_pointer
+    smallest_err = 100000
+    smallest_err_iter_num = -1
+    submission_store = []  # store submission data points (txt)
+    result_store = []  # store points for plotting
+    ADE_save, FDE_save = [], []
+    for iteration in range(sample_args.iteration):
+        # Initialize net
+        net = get_model(sample_args.method, saved_args, True)
+        if sample_args.use_cuda:
+            net = net.cuda()
+        # Get the checkpoint path
+        checkpoint_path = os.path.join(save_directory, save_tar_name + str(sample_args.epoch) + '.tar')
+        if os.path.isfile(checkpoint_path):
+            print('Loading checkpoint')
+            checkpoint = torch.load(checkpoint_path)
+            model_epoch = checkpoint['epoch']  # 读取保存的epoch
+            net.load_state_dict(checkpoint['state_dict'])  # 读取保存的模型参数
+            print('Loaded checkpoint at epoch', model_epoch)
+        # For each batch
+        iteration_submission, iteration_result, results, submission = [], [], [], []
+
+        # Variable to maintain total error
+        total_error, final_error = 0, 0
+
+        for batch in range(dataloader.num_batches):
+            start = time.time()
+            # Get data
+            x, y, d, numPedsList, PedsList, target_ids = dataloader.next_batch()
+
+            # Get the sequence
+            x_seq, d_seq, numPedsList_seq, PedsList_seq, target_id = x[0], d[0], numPedsList[0], PedsList[0], \
+                                                                     target_ids[0]
+            dataloader.clean_test_data(x_seq, target_id, sample_args.obs_length, sample_args.pred_length)
+            dataloader.clean_ped_list(x_seq, PedsList_seq, target_id, sample_args.obs_length, sample_args.pred_length)
+
+            # get processing file name and then get dimensions of file
+            folder_name = dataloader.get_directory_name_with_pointer(d_seq)
+            dataset_data = dataloader.get_dataset_dimension(folder_name)
+
+            # dense vector creation
+            x_seq, lookup_seq = dataloader.convert_proper_array(x_seq, numPedsList_seq, PedsList_seq)
+
+            # will be used for error calculation
+            orig_x_seq = x_seq.clone()
+
+            # grid mask calculation
+            if sample_args.method == 2:  # obstacle lstm
+                grid_seq = getSequenceGridMask(0, lookup_seq, x_seq, dataset_data, PedsList_seq,
+                                               saved_args.neighborhood_size,
+                                               saved_args.grid_size, saved_args.use_cuda, True)
+            elif sample_args.method == 1:  # social lstm, we just revised the parameters of get--Mask in Social LSTM!!
+                grid_seq = getSequenceGridMask(0, lookup_seq, x_seq, dataset_data, PedsList_seq,
+                                               saved_args.neighborhood_size,
+                                               saved_args.grid_size, saved_args.use_cuda)
+
+            # vectorize datapoints, convert the absolute position into relative position
+            x_seq, first_values_dict, x_seq_direction, x_seq_velocity = vectorize_seq(x_seq, PedsList_seq, lookup_seq)
+            if sample_args.use_cuda:
+                x_seq = x_seq.cuda()
+                x_seq_direction = x_seq_direction.cuda()
+                x_seq_velocity = x_seq_velocity.cuda()
+
+            # The sample function
+            if sample_args.method == 3:  # vanilla lstm
+                # Extract the observed part of the trajectories
+                obs_traj, obs_PedsList_seq = x_seq[:sample_args.obs_length], PedsList_seq[:sample_args.obs_length]
+                # should add one extra element in third of sample
+                ret_x_seq = sample(obs_traj, obs_PedsList_seq, sample_args, net, x_seq, PedsList_seq, saved_args,
+                                   dataset_data, dataloader, lookup_seq, numPedsList_seq, sample_args.gru)
+            else:
+                # Extract the observed part of the trajectories
+                # We just revised the parameters of sample in Social LSTM, the sample in vanilla lstm is not revised!!
+                obs_traj, obs_PedsList_seq, obs_grid = x_seq[:sample_args.obs_length], PedsList_seq[
+                                                                                       :sample_args.obs_length], grid_seq[
+                                                                                                                 :sample_args.obs_length]
+                ret_x_seq = sample(obs_traj, obs_PedsList_seq, sample_args, net, x_seq, PedsList_seq, saved_args,
+                                   dataset_data, dataloader, lookup_seq, numPedsList_seq, x_seq_direction,
+                                   x_seq_velocity, sample_args.gru, obs_grid)
+
+            # revert the points back to original space, in other words, transfer the relative position into absolute position
+            ret_x_seq = revert_seq(ret_x_seq, PedsList_seq, lookup_seq, first_values_dict)
+
+            # Record the mean and final displacement error
+
+            total_error += get_mean_error(ret_x_seq[1:sample_args.obs_length].data,
+                                          orig_x_seq[1:sample_args.obs_length].data,
+                                          PedsList_seq[1:sample_args.obs_length],
+                                          PedsList_seq[1:sample_args.obs_length], sample_args.use_cuda, lookup_seq)
+            final_error += get_final_error(ret_x_seq[1:sample_args.obs_length].data,
+                                           orig_x_seq[1:sample_args.obs_length].data,
+                                           PedsList_seq[1:sample_args.obs_length],
+                                           PedsList_seq[1:sample_args.obs_length], lookup_seq)
+            end = time.time()
+
+            print('Current file : ', dataloader.get_file_name(0), ' Processed trajectory number : ', batch + 1,
+                  'out of', dataloader.num_batches, 'trajectories in time', end - start)
+            # We can say that this way will not running!
+            if dataset_pointer_ins is not dataloader.dataset_pointer:
+                if dataloader.dataset_pointer is not 0:
+                    iteration_submission.append(submission)
+                    iteration_result.append(results)
+
+                dataset_pointer_ins = dataloader.dataset_pointer
+                submission = []
+                results = []
+
+            submission.append(submission_preprocess(dataloader, ret_x_seq.data[:, lookup_seq[target_id], :].numpy(),
+                                                    sample_args.pred_length, sample_args.obs_length, target_id))
+            results.append((x_seq.data.cpu().numpy(), ret_x_seq.data.cpu().numpy(), PedsList_seq, lookup_seq,
+                            dataloader.get_frame_sequence(seq_lenght), target_id, sample_args.obs_length))
+
+        iteration_submission.append(submission)
+        iteration_result.append(results)
+
+        submission_store.append(iteration_submission)
+        result_store.append(iteration_result)
+
+        if total_error < smallest_err:
+            print("**********************************************************")
+            print('Best iteration has been changed. Previous best iteration: ', smallest_err_iter_num + 1, 'Error: ',
+                  smallest_err / dataloader.num_batches)
+            print('New best iteration : ', iteration + 1, 'Error: ', total_error / dataloader.num_batches)
+            smallest_err_iter_num = iteration
+            smallest_err = total_error
+
+        print('Iteration:', iteration + 1, ' Total training (observed part) mean error of the model is ',
+              total_error / dataloader.num_batches)
+        print('Iteration:', iteration + 1, 'Total training (observed part) final error of the model is ',
+              final_error / dataloader.num_batches)
+        ADE_save.append(total_error / dataloader.num_batches)
+        FDE_save.append(final_error / dataloader.num_batches)
+        # print(submission)
+
+    print('Smallest error iteration:', smallest_err_iter_num + 1)
+    dataloader.write_to_file(submission_store[smallest_err_iter_num], result_directory, prefix, model_name)
+    dataloader.write_to_plot_file(result_store[smallest_err_iter_num],
+                                  os.path.join(plot_directory, plot_test_file_directory))
+    ic(sum(ADE_save)/len(ADE_save))
+    ic(sum(FDE_save)/len(FDE_save))
+
+
+def sample(x_seq, Pedlist, args, net, true_x_seq, true_Pedlist, saved_args, dimensions, dataloader, look_up,
+           num_pedlist, x_seq_direction, x_seq_velocity, is_gru, grid=None):
+    '''
+    The sample function
+    params:
+    x_seq: Input positions
+    Pedlist: Peds present in each frame
+    args: arguments
+    net: The model
+    true_x_seq: True positions
+    true_Pedlist: The true peds present in each frame
+    saved_args: Training arguments
+    dimensions: The dimensions of the dataset
+    target_id: ped_id number that try to predict in this sequence
+    x_seq_direction: represents relative direction
+    x_seq_velocity: represents relative velocity
+    '''
+    # Number of peds in the sequence
+    numx_seq = len(look_up)
+    with torch.no_grad():
+        # Construct variables for hidden and cell states
+        hidden_states = Variable(torch.zeros(numx_seq, net.args.rnn_size))
+        if args.use_cuda:
+            hidden_states = hidden_states.cuda()
+        if not is_gru:
+            cell_states = Variable(torch.zeros(numx_seq, net.args.rnn_size))
+            if args.use_cuda:
+                cell_states = cell_states.cuda()
+        else:
+            cell_states = None
+        ret_x_seq = Variable(torch.zeros(args.obs_length + args.pred_length, numx_seq, 2))
+        # Initialize the return data structure
+        if args.use_cuda:
+            ret_x_seq = ret_x_seq.cuda()
+
+        # For the observed part of the trajectory
+        weight_cluster_ = torch.zeros(args.particle_number, numx_seq, 2)  # particle weight restored place
+        for tstep in range(args.obs_length - 1):
+            # particle_main = x_seq[tstep]  # a tensor,use observation dataset
+            cum_ = torch.zeros(args.particle_number, numx_seq, 2)
+            if grid is None:  # vanilla lstm
+                # Do a forward prop
+                out_obs, hidden_states, cell_states = net(x_seq[tstep].view(1, numx_seq, 2), hidden_states, cell_states,
+                                                          [Pedlist[tstep]], [num_pedlist[tstep]], dataloader, look_up)
+            else:
+                # Do a forward prop
+                out_obs, hidden_states, cell_states = net(x_seq[tstep].view(1, numx_seq, 2), [grid[tstep]],
+                                                          hidden_states, cell_states, [Pedlist[tstep]],
+                                                          [num_pedlist[tstep]], dataloader, look_up,
+                                                          x_seq_direction[tstep].view(1, numx_seq, 2),
+                                                          x_seq_velocity[tstep].view(1, numx_seq, 2))
+            mux, muy, sx, sy, corr = getCoef(out_obs)
+            next_x, next_y, next_values_cluster_ = sample_gaussian_2d(args.particle_number, mux.data, muy.data, sx.data,
+                                                                      sy.data, corr.data, true_Pedlist[tstep], look_up)
+            next_values_cluster_copy = next_values_cluster_.clone()
+
+            # if particle_main = x_seq[tstep] this code is used, then the following four codes do not needed, just delete!
+            particle_main = torch.zeros(numx_seq, 2)
+            for i in range(numx_seq):
+                particle_main_i = torch.from_numpy(np.mean(next_values_cluster_.clone().numpy()[i, :], axis=0))
+                particle_main[i] = particle_main_i
+
+            for i in range(next_values_cluster_.shape[1]):  # the shape represents the particle numbers, here is 100.
+                particle_i = next_values_cluster_[:, i]
+                weight_cluster_[i] = 1 / (np.sqrt(2 * np.pi * (1 / 100))) * np.exp(
+                    -(particle_main - particle_i) ** 2 / (2 * (1 / 100)))
+
+            # function for drawing peds distribution.
+            # particle_gaussian_distribution_drawing(next_values_cluster_.clone().numpy(), numx_seq, args.particle_number)
+
+            # function for drawing weights distribution.
+            # weight_gaussian_distribution_drawing(weight_cluster_.clone().numpy(), numx_seq, args.particle_number)
+
+            weight_cluster_ = weight_cluster_ / (sum(weight_cluster_) + 1e-20)  # add a bias to avoid NAN
+
+            # function for drawing norm weights distribution.
+            # weight_gaussian_distribution_drawing(weight_cluster_.clone().numpy(), numx_seq, args.particle_number)
+
+            for j in range(next_values_cluster_.shape[1]):  # the shape represents the particle numbers, here is 100.
+                cum_[j] = functools.reduce(lambda x, y: x + y, weight_cluster_[:j + 1])
+
+            # Next time, we begin to design sampling process.
+            # First step, generate index array for each circulate.
+            for i in range(numx_seq):
+                i_x = resampling_process(cum_[:, i, 0], args.particle_number)
+                i_y = resampling_process(cum_[:, i, 1], args.particle_number)
+                next_values_cluster_copy[i, [k for k in range(args.particle_number)], 0] = next_values_cluster_[
+                    i, i_x, 0]
+                next_values_cluster_copy[i, [k for k in range(args.particle_number)], 1] = next_values_cluster_[
+                    i, i_y, 1]
+            # Second step,average the array to compress the array dimension.
+            next_values_cluster_copy = next_values_cluster_copy.mean(axis=1, keepdim=False)
+            # Third step,divide into two different dimension called x coordinate and y coordinate respectively.
+            new_x = next_values_cluster_copy[:, 0]
+            new_y = next_values_cluster_copy[:, 1]
+
+            ret_x_seq[tstep + 1, :, 0] = new_x
+            ret_x_seq[tstep + 1, :, 1] = new_y
+
+        # We use direct copy of observed part and not use of prediction. Thus, test error will be closed to 0.
+        # ret_x_seq[:args.obs_length, :, :] = x_seq.clone()
+        if grid is not None:  # no vanilla lstm
+            prev_grid = grid[-1].clone()
+
+        x_seq_direction_ = torch.zeros(ret_x_seq.shape)
+        x_seq_velocity_ = torch.zeros(ret_x_seq.shape)
+
+        # For the predicted part of the trajectory
+        for tstep in range(args.obs_length - 1, args.pred_length + args.obs_length - 1):
+            cum_ = torch.zeros(args.particle_number, numx_seq, 2)
+            if grid is None:  # vanilla lstm
+                ic('grid is NULL')
+                outputs, hidden_states, cell_states = net(ret_x_seq[tstep].view(1, numx_seq, 2), hidden_states,
+                                                          cell_states, [true_Pedlist[tstep]], [num_pedlist[tstep]],
+                                                          dataloader, look_up)
+            else:
+                outputs, hidden_states, cell_states = net(ret_x_seq[tstep].view(1, numx_seq, 2), [prev_grid],
+                                                          hidden_states, cell_states, [true_Pedlist[tstep]],
+                                                          [num_pedlist[tstep]], dataloader, look_up,
+                                                          x_seq_direction[tstep].view(1, numx_seq, 2),
+                                                          x_seq_velocity[tstep].view(1, numx_seq, 2))
+            mux, muy, sx, sy, corr = getCoef(outputs)
+            next_x, next_y, next_values_cluster_ = sample_gaussian_2d(args.particle_number, mux.data, muy.data, sx.data,
+                                                                      sy.data, corr.data, true_Pedlist[tstep], look_up)
+            next_values_cluster_copy = next_values_cluster_.clone()
+            particle_main = torch.zeros(numx_seq, 2)
+
+            for i in range(numx_seq):
+                particle_main_i = torch.from_numpy(np.mean(next_values_cluster_.clone().numpy()[i, :], axis=0))
+                particle_main[i] = particle_main_i
+            for i in range(next_values_cluster_.shape[1]):
+                particle_i = next_values_cluster_[:, i]
+                weight_cluster_[i] = 1 / (np.sqrt(2 * np.pi * (1 / 100))) * np.exp(
+                    -(particle_main - particle_i) ** 2 / (2 * (1 / 100)))
+            weight_cluster_ = weight_cluster_ / sum(weight_cluster_)
+            for j in range(next_values_cluster_.shape[1]):
+                cum_[j] = functools.reduce(lambda x, y: x + y, weight_cluster_[:j + 1])
+            for i in range(numx_seq):
+                i_x = resampling_process(cum_[:, i, 0], args.particle_number)
+                i_y = resampling_process(cum_[:, i, 1], args.particle_number)
+                next_values_cluster_copy[i, [k for k in range(args.particle_number)], 0] = next_values_cluster_[
+                    i, i_x, 0]
+                next_values_cluster_copy[i, [k for k in range(args.particle_number)], 1] = next_values_cluster_[
+                    i, i_y, 1]
+            next_values_cluster_copy = next_values_cluster_copy.mean(axis=1, keepdim=False)
+            new_x = next_values_cluster_copy[:, 0]
+            new_y = next_values_cluster_copy[:, 1]
+            # here we need to add a lot of codes
+            ret_x_seq[tstep + 1, :, 0] = new_x
+            ret_x_seq[tstep + 1, :, 1] = new_y
+            # make a copy so that ret_x_seq_copy revised will not influence ret_x_seq
+            ret_x_seq_copy = ret_x_seq.numpy().copy()
+            # List of x_seq at the last time-step (assuming they exist until the end)
+            true_Pedlist[tstep + 1] = [int(_x_seq) for _x_seq in true_Pedlist[tstep + 1]]
+            next_ped_list = true_Pedlist[tstep + 1].copy()
+            converted_pedlist = [look_up[_x_seq] for _x_seq in next_ped_list]
+            list_of_x_seq = Variable(torch.LongTensor(converted_pedlist))
+            if args.use_cuda:
+                list_of_x_seq = list_of_x_seq.cuda()
+            # Get their predicted positions
+            current_x_seq = torch.index_select(ret_x_seq[tstep + 1], 0, list_of_x_seq)
+
+            if grid is not None:  # no vanilla lstm
+                # Compute the new grid masks with the predicted positions
+                if args.method == 2:  # obstacle lstm, the parameters of getGridMask should be revised
+                    prev_grid = getGridMask(current_x_seq.data.cpu(), dimensions, len(true_Pedlist[tstep + 1]),
+                                            saved_args.neighborhood_size, saved_args.grid_size, True)
+                elif args.method == 1:  # social lstm
+                    ped_past = true_Pedlist[tstep]
+                    ped_current = true_Pedlist[tstep + 1]
+                    if (len(ped_past) < len(ped_current)) or (len(ped_past) > len(ped_current)):
+                        for ped in ped_current:
+                            if ped in ped_past:
+                                past_position = ret_x_seq_copy[tstep][look_up[ped], 0:2]
+                                current_position = ret_x_seq_copy[tstep + 1][look_up[ped], 0:2]
+                                past_current_diff = current_position - past_position
+                                past_current_diff_norm = np.linalg.norm(past_current_diff)
+                                direction = past_current_diff / (past_current_diff_norm + 1e-8)
+                                velocity = past_current_diff / 0.4
+                                direction = torch.tensor(direction)
+                                velocity = torch.tensor(velocity)
+                                x_seq_velocity_[tstep + 1, look_up[ped], 0:2] = velocity
+                                x_seq_direction_[tstep + 1, look_up[ped], 0:2] = direction
+                    elif len(ped_past) == len(ped_current):
+                        res_equal = operator.eq(ped_past, ped_current)
+                        if res_equal:
+                            for ped in ped_current:
+                                past_position = ret_x_seq_copy[tstep][look_up[ped], 0:2]
+                                current_position = ret_x_seq_copy[tstep + 1][look_up[ped], 0:2]
+                                past_current_diff = current_position - past_position
+                                past_current_diff_norm = np.linalg.norm(past_current_diff)
+                                direction = past_current_diff / (past_current_diff_norm + 1e-8)
+                                velocity = past_current_diff / 0.4
+                                direction = torch.tensor(direction)
+                                velocity = torch.tensor(velocity)
+                                x_seq_velocity_[tstep + 1, look_up[ped], 0:2] = velocity
+                                x_seq_direction_[tstep + 1, look_up[ped], 0:2] = direction
+                        else:
+                            similar_list = list(set(ped_past) & set(ped_current))
+                            if len(similar_list) == 0:
+                                continue
+                            else:
+                                for ped in ped_current:
+                                    past_position = ret_x_seq_copy[tstep][look_up[ped], 0:2]
+                                    current_position = ret_x_seq_copy[tstep + 1][look_up[ped], 0:2]
+                                    past_current_diff = current_position - past_position
+                                    past_current_diff_norm = np.linalg.norm(past_current_diff)
+                                    direction = past_current_diff / (past_current_diff_norm + 1e-8)
+                                    velocity = past_current_diff / 0.4
+                                    direction = torch.tensor(direction)
+                                    velocity = torch.tensor(velocity)
+                                    x_seq_direction_[tstep + 1, look_up[ped], 0:2] = direction
+                                    x_seq_velocity_[tstep + 1, look_up[ped], 0:2] = velocity
+
+                    prev_grid = getGridMask(0, x_seq_direction_[tstep + 1], current_x_seq.data.cpu(), dimensions,
+                                            len(true_Pedlist[tstep + 1]),
+                                            saved_args.neighborhood_size, saved_args.grid_size)
+                prev_grid = Variable(torch.from_numpy(prev_grid).float())
+                if args.use_cuda:
+                    prev_grid = prev_grid.cuda()
+            # We use clone() to update the value of x_seq_direction and x_seq_velocity
+            x_seq_direction = x_seq_direction_.clone()
+            x_seq_velocity = x_seq_velocity_.clone()
+        return ret_x_seq
+
+
+def submission_preprocess(dataloader, ret_x_seq, pred_length, obs_length, target_id):
+    seq_lenght = pred_length + obs_length
+
+    # begin and end index of obs. frames in this seq.
+    begin_obs = (dataloader.frame_pointer - seq_lenght)
+    end_obs = (dataloader.frame_pointer - pred_length)
+
+    # get original data for frame number and ped ids
+    # observed_data = dataloader.orig_data[dataloader.dataset_pointer][begin_obs:end_obs, :]
+    frame_number_predicted = dataloader.get_frame_sequence(pred_length)  # predicted length
+    ret_x_seq_c = ret_x_seq[obs_length:].copy()  # predicted length
+    ret_x_seq_c[:, [0, 1]] = ret_x_seq_c[:, [1, 0]]  # x, y -> y, x
+    repeated_id_pred = np.repeat(target_id, pred_length)  # add id
+    id_integrated_prediction = np.append(repeated_id_pred[:, None], ret_x_seq_c, axis=1)
+    frame_integrated_prediction = np.append(frame_number_predicted[:, None], id_integrated_prediction, axis=1)
+
+    all_frames_per_sequence = dataloader.get_frame_sequence(seq_lenght)  # pred+obs length
+    frame_number_observed = all_frames_per_sequence[:obs_length]  # observed length
+    ret_x_seq_o = ret_x_seq[:obs_length].copy()
+    ret_x_seq_o[:, [0, 1]] = ret_x_seq_o[:, [1, 0]]
+    repeated_id_obs = np.repeat(target_id, obs_length)
+    id_integrated_observation = np.append(repeated_id_obs[:, None], ret_x_seq_o, axis=1)
+    frame_integrated_observation = np.append(frame_number_observed[:, None], id_integrated_observation, axis=1)
+    result = np.append(frame_integrated_observation, frame_integrated_prediction, axis=0)
+    return result
+
+
+def resampling_process(listname, n):
+    ran_w = np.random.rand(n)  # 产生N个随机数
+    dd = [0 for i in range(n)]
+    for i in range(len(ran_w)):
+        j = 0
+        while ran_w[i] > listname[j]:  # 若随机数在区间之内，则将下标(j+1)存入dd中；listname中存储的是粒子的权重
+            if j < n - 1:
+                if ran_w[i] <= listname[j + 1]:
+                    break
+                else:
+                    j += 1
+            else:
+                j = j - 1
+                break
+        dd[i] = j + 1
+    return dd
+
+
+def weight_gaussian_distribution_drawing(data, ped_ids, M):
+    for i in range(ped_ids):
+        mean_i = np.mean(data[:, i], axis=0)
+        cov_i = np.cov(data[:, i, 0], data[:, i, 1])
+        Gaussian = multivariate_normal(mean_i, cov_i, True)
+        X, Y = np.meshgrid(np.linspace(-1, 1, M), np.linspace(-1, 1, M))
+        d = np.dstack([X, Y])
+        Z = Gaussian.pdf(d).reshape(M, M)
+
+        fig = plt.figure(figsize=(6, 4))
+        ax = Axes3D(fig)
+        ax.plot_surface(X, Y, Z, rstride=1, cstride=1, cmap='seismic', alpha=0.8)
+        ax.set_xlabel('X')
+        ax.set_ylabel('Y')
+        ax.set_zlabel('Z')
+        plt.show()
+
+        plt.figure()
+        plt.xlabel("X")
+        plt.ylabel("Y")
+        x, y = data[:, i].T
+        plt.plot(x, y, 'ko', alpha=0.3)
+        plt.contour(X, Y, Z, alpha=1.0, zorder=10)
+        plt.show()
+
+
+def particle_gaussian_distribution_drawing(data, ped_ids, M):
+    for i in range(ped_ids):
+        mean_i = np.mean(data[i, :], axis=0)
+        cov_i = np.cov(data[i, :, 0], data[i, :, 1])
+        Gaussian = multivariate_normal(mean_i, cov_i, True)
+        X, Y = np.meshgrid(np.linspace(-1, 1, M), np.linspace(-1, 1, M))
+        d = np.dstack([X, Y])
+        Z = Gaussian.pdf(d).reshape(M, M)
+
+        fig = plt.figure(figsize=(6, 4))
+        ax = Axes3D(fig)
+        ax.plot_surface(X, Y, Z, rstride=1, cstride=1, cmap='seismic', alpha=0.8)
+        ax.set_xlabel('X')
+        ax.set_ylabel('Y')
+        ax.set_zlabel('Z')
+        plt.show()
+
+        plt.figure()
+        plt.xlabel("X")
+        plt.ylabel("Y")
+        x, y = data[i, :].T
+        plt.plot(x, y, 'ko', alpha=0.3)
+        plt.contour(X, Y, Z, alpha=1.0, zorder=10)
+        plt.show()
+
+
+if __name__ == '__main__':
+    main()
